@@ -164,6 +164,8 @@ export default function AdminPage() {
   const [isSubmittingProject, setIsSubmittingProject] = useState(false);
   const [formSuccessMessage, setFormSuccessMessage] = useState('');
   const [formErrorMessage, setFormErrorMessage] = useState('');
+  const [directVideoUrl, setDirectVideoUrl] = useState('');
+  const [directPosterUrl, setDirectPosterUrl] = useState('');
 
   // Live hashtag extraction from description
   const detectedFormTags = useMemo(() => {
@@ -319,66 +321,154 @@ export default function AdminPage() {
       console.warn('Auto dimension detection error:', e);
     }
 
-    // 2. Upload to server
+    // 2. Upload video with direct Cloudinary bypass
     setIsUploadingShowcaseVideo(true);
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('type', 'video');
-    formData.append('mode', 'raw');
-
     try {
-      const res = await fetch('/api/admin/upload', {
-        method: 'POST',
-        body: formData,
+      const data = await uploadMediaFileDirect(file, 'video', 'raw');
+      setShowcaseItems((prev) => {
+        const next = [...prev];
+        if (next[selectedShowcaseIdx]) {
+          next[selectedShowcaseIdx] = {
+            ...next[selectedShowcaseIdx],
+            videoMp4: data.videoMp4,
+            videoWebm: data.videoWebm || data.videoMp4,
+            videoSrc: data.videoMp4,
+            ...(data.poster ? { posterSrc: data.poster } : {}),
+          };
+        }
+        return next;
       });
-      const data = await res.json();
-      if (data.success) {
-        setShowcaseItems((prev) => {
-          const next = [...prev];
-          if (next[selectedShowcaseIdx]) {
-            next[selectedShowcaseIdx] = {
-              ...next[selectedShowcaseIdx],
-              videoMp4: data.videoMp4,
-              videoWebm: data.videoWebm || data.videoMp4,
-              videoSrc: data.videoMp4,
-              ...(data.poster ? { posterSrc: data.poster } : {}),
-            };
-          }
-          return next;
-        });
-      } else {
-        alert(data.error || 'Video upload failed');
-      }
-    } catch {
-      alert('Upload failed due to network error');
+    } catch (err: any) {
+      alert(err.message || 'Video upload failed');
     } finally {
       setIsUploadingShowcaseVideo(false);
       if (showcaseVideoInputRef.current) showcaseVideoInputRef.current.value = '';
     }
   };
 
+  // Helper for resilient direct-to-Cloudinary upload (bypasses Vercel 4.5MB serverless limits)
+  const uploadMediaFileDirect = async (
+    file: File,
+    resourceType: 'video' | 'image',
+    mode: 'raw' | 'compressed' = 'raw',
+    onProgress?: (percent: number) => void
+  ): Promise<{ videoMp4: string; videoWebm: string; poster: string; url?: string; storage: string }> => {
+    // 1. Try direct Cloudinary upload first
+    try {
+      const sigRes = await fetch('/api/admin/upload-signature', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resourceType }),
+      });
+      if (sigRes.ok) {
+        const sigData = await sigRes.json();
+        if (sigData.success && sigData.signature) {
+          return await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open(
+              'POST',
+              `https://api.cloudinary.com/v1_1/${sigData.cloudName}/${resourceType}/upload`
+            );
+
+            if (xhr.upload && onProgress) {
+              xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                  const percent = Math.round((e.loaded / e.total) * 100);
+                  onProgress(percent);
+                }
+              };
+            }
+
+            xhr.onload = () => {
+              if (xhr.status >= 200 && xhr.status < 300) {
+                try {
+                  const resData = JSON.parse(xhr.responseText);
+                  const qualityParam = mode === 'raw' ? 'q_auto:best' : 'q_auto:good';
+                  const versionStr = resData.version ? `v${resData.version}/` : '';
+                  const videoWebm = `https://res.cloudinary.com/${sigData.cloudName}/video/upload/${qualityParam},vc_vp9/${versionStr}${resData.public_id}.webm`;
+                  const videoMp4 = resData.secure_url;
+                  const poster = `https://res.cloudinary.com/${sigData.cloudName}/video/upload/so_0,f_webp,${qualityParam}/${versionStr}${resData.public_id}.webp`;
+
+                  resolve({
+                    videoMp4,
+                    videoWebm,
+                    poster,
+                    url: resData.secure_url,
+                    storage: 'cloudinary',
+                  });
+                } catch {
+                  reject(new Error('Failed to parse Cloudinary response'));
+                }
+              } else {
+                try {
+                  const err = JSON.parse(xhr.responseText);
+                  reject(new Error(err.error?.message || `Cloudinary upload error (${xhr.status})`));
+                } catch {
+                  reject(new Error(`Cloudinary returned status ${xhr.status}`));
+                }
+              }
+            };
+
+            xhr.onerror = () => reject(new Error('Cloudinary direct upload network error'));
+
+            const cfd = new FormData();
+            cfd.append('file', file);
+            cfd.append('api_key', sigData.apiKey);
+            cfd.append('timestamp', String(sigData.timestamp));
+            cfd.append('signature', sigData.signature);
+            cfd.append('folder', sigData.folder);
+
+            xhr.send(cfd);
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('Direct Cloudinary upload fallback to server:', err);
+    }
+
+    // 2. Server route fallback
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('type', resourceType === 'image' ? 'poster' : 'video');
+    formData.append('mode', mode);
+
+    const res = await fetch('/api/admin/upload', {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      if (res.status === 413 || text.includes('Request Entity Too Large') || text.includes('FUNCTION_PAYLOAD_TOO_LARGE')) {
+        throw new Error('Video file is larger than 4.5MB. Direct upload is configured to handle large files; please try again or paste a video URL directly.');
+      }
+      throw new Error(`Upload server error (${res.status}): ${text.slice(0, 100)}`);
+    }
+
+    const data = await res.json();
+    if (!data.success) {
+      throw new Error(data.error || 'Upload failed');
+    }
+
+    return {
+      videoMp4: data.videoMp4,
+      videoWebm: data.videoWebm || data.videoMp4,
+      poster: data.poster || data.url,
+      url: data.url || data.poster,
+      storage: data.storage || 'local',
+    };
+  };
+
   // Upload Custom Poster directly
   const handleShowcasePosterSelect = async (file: File) => {
     if (!file) return;
     setIsUploadingShowcasePoster(true);
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('type', 'poster');
-    formData.append('mode', 'raw');
 
     try {
-      const res = await fetch('/api/admin/upload', {
-        method: 'POST',
-        body: formData,
-      });
-      const data = await res.json();
-      if (data.success) {
-        updateCurrentShowcaseField('posterSrc', data.url || data.poster);
-      } else {
-        alert(data.error || 'Poster upload failed');
-      }
-    } catch {
-      alert('Poster upload failed due to network error');
+      const data = await uploadMediaFileDirect(file, 'image', 'raw');
+      updateCurrentShowcaseField('posterSrc', data.url || data.poster);
+    } catch (err: any) {
+      alert(err.message || 'Poster upload failed');
     } finally {
       setIsUploadingShowcasePoster(false);
       if (showcasePosterInputRef.current) showcasePosterInputRef.current.value = '';
@@ -481,43 +571,46 @@ export default function AdminPage() {
     uploadSelectedFile(file);
   };
 
-  // Upload Video File to Cloudinary / Local API
+  // Upload Video File to Cloudinary / Local API with Direct Upload support
   const uploadSelectedFile = async (file: File) => {
     setIsUploading(true);
-    setUploadProgress(15);
+    setUploadProgress(10);
     setFormErrorMessage('');
 
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('type', 'video');
-      formData.append('mode', uploadMode);
-
-      setUploadProgress(45);
-      const res = await fetch('/api/admin/upload', {
-        method: 'POST',
-        body: formData,
+      const data = await uploadMediaFileDirect(file, 'video', uploadMode, (p) => {
+        setUploadProgress(Math.max(10, Math.min(95, p)));
       });
 
-      setUploadProgress(85);
-      const data = await res.json();
-
-      if (data.success) {
-        setUploadedResult({
-          videoMp4: data.videoMp4,
-          videoWebm: data.videoWebm,
-          poster: data.poster,
-          storage: data.storage,
-        });
-        setUploadProgress(100);
-      } else {
-        setFormErrorMessage(data.error || 'Upload failed');
-      }
+      setUploadedResult({
+        videoMp4: data.videoMp4,
+        videoWebm: data.videoWebm,
+        poster: data.poster,
+        storage: data.storage,
+      });
+      setUploadProgress(100);
     } catch (err: any) {
-      setFormErrorMessage(err.message || 'Upload connection error');
+      setFormErrorMessage(err.message || 'Upload error');
     } finally {
       setIsUploading(false);
     }
+  };
+
+  // Handle manually pasted video URL
+  const handleApplyDirectUrl = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!directVideoUrl.trim()) {
+      setFormErrorMessage('Please enter a video URL');
+      return;
+    }
+    setUploadedResult({
+      videoMp4: directVideoUrl.trim(),
+      videoWebm: directVideoUrl.trim(),
+      poster: directPosterUrl.trim() || '/assets/burger-promo-poster.webp',
+      storage: 'direct',
+    });
+    setFormSuccessMessage('Video URL configured and ready to publish!');
+    setTimeout(() => setFormSuccessMessage(''), 3500);
   };
 
   // Create Project Submit Handler
@@ -1690,6 +1783,34 @@ export default function AdminPage() {
                     </div>
                     <div style={styles.dropzoneSub}>MP4, MOV, WebM (auto-detects dimensions and duration)</div>
                   </label>
+                </div>
+
+                {/* Direct URL Input Alternative */}
+                <div style={{ marginTop: '14px', padding: '14px', background: 'rgba(255,255,255,0.02)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.07)' }}>
+                  <div style={{ fontSize: '11px', color: '#aaa', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '8px', fontWeight: 600 }}>
+                    Or Paste Video URL Directly
+                  </div>
+                  <input
+                    type="url"
+                    placeholder="https://... direct .mp4 or Cloudinary URL"
+                    value={directVideoUrl}
+                    onChange={(e) => setDirectVideoUrl(e.target.value)}
+                    style={{ ...styles.input, marginBottom: '8px', fontSize: '13px' }}
+                  />
+                  <input
+                    type="url"
+                    placeholder="Optional poster image URL"
+                    value={directPosterUrl}
+                    onChange={(e) => setDirectPosterUrl(e.target.value)}
+                    style={{ ...styles.input, marginBottom: '10px', fontSize: '13px' }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleApplyDirectUrl()}
+                    style={{ ...styles.secondaryBtn, width: '100%', fontSize: '12px', padding: '8px', background: directVideoUrl ? 'rgba(255,128,179,0.15)' : undefined, color: directVideoUrl ? '#ff80b3' : undefined }}
+                  >
+                    Use This Video URL
+                  </button>
                 </div>
 
                 {/* Automatic Detection Info */}
